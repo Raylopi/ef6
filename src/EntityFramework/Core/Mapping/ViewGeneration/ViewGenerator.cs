@@ -2,6 +2,7 @@
 
 namespace System.Data.Entity.Core.Mapping.ViewGeneration
 {
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Data.Entity.Core.Common.CommandTrees;
     using System.Data.Entity.Core.Common.Utils;
@@ -12,6 +13,7 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
     using System.Diagnostics;
     using System.Linq;
     using System.Text;
+    using System.Threading.Tasks;
     using ViewSet = System.Data.Entity.Core.Common.Utils.KeyToListMap<Metadata.Edm.EntitySetBase, GeneratedView>;
     using CellGroup = System.Data.Entity.Core.Common.Utils.Set<Structures.Cell>;
     using WrapperBoolExpr = System.Data.Entity.Core.Common.Utils.Boolean.BoolExpr<Structures.LeftCellWrapper>;
@@ -28,7 +30,7 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
         private readonly ConfigViewGenerator m_config; // Configuration variables
         private readonly MemberDomainMap m_queryDomainMap;
         private readonly MemberDomainMap m_updateDomainMap;
-        private readonly Dictionary<EntitySetBase, QueryRewriter> m_queryRewriterCache;
+        private readonly ConcurrentDictionary<EntitySetBase, QueryRewriter> m_queryRewriterCache;
         private readonly List<ForeignConstraint> m_foreignKeyConstraints;
         private readonly EntityContainerMapping m_entityContainerMapping;
 
@@ -39,15 +41,25 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
             CellGroup cellGroup, ConfigViewGenerator config,
             List<ForeignConstraint> foreignKeyConstraints,
             EntityContainerMapping entityContainerMapping)
+            : this(cellGroup, config, foreignKeyConstraints, entityContainerMapping,
+                   MetadataHelper.BuildUndirectedGraphOfTypes(entityContainerMapping.StorageMappingItemCollection.EdmItemCollection))
+        {
+        }
+
+        // effects: Creates a ViewGenerator object using a pre-computed inheritance graph,
+        // avoiding redundant recomputation when generating views for multiple cell groups.
+        internal ViewGenerator(
+            CellGroup cellGroup, ConfigViewGenerator config,
+            List<ForeignConstraint> foreignKeyConstraints,
+            EntityContainerMapping entityContainerMapping,
+            Dictionary<EntityType, Set<EntityType>> inheritanceGraph)
         {
             m_cellGroup = cellGroup;
             m_config = config;
-            m_queryRewriterCache = new Dictionary<EntitySetBase, QueryRewriter>();
+            m_queryRewriterCache = new ConcurrentDictionary<EntitySetBase, QueryRewriter>();
             m_foreignKeyConstraints = foreignKeyConstraints;
             m_entityContainerMapping = entityContainerMapping;
 
-            var inheritanceGraph =
-                MetadataHelper.BuildUndirectedGraphOfTypes(entityContainerMapping.StorageMappingItemCollection.EdmItemCollection);
             SetConfiguration(entityContainerMapping);
 
             // We fix all the cells at this point
@@ -274,12 +286,85 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
 
             // Partition cells by extent.
             var extentCellMap = GroupCellsByExtent(m_cellGroup, viewTarget);
+            var extents = extentCellMap.Keys.ToList();
 
-            // Keep track of the mapping exceptions that we have generated
+            // For a single extent, skip parallel overhead
+            if (extents.Count <= 1)
+            {
+                return GenerateDirectionalViewsSequential(viewTarget, isQueryView, extents, identifiers, views);
+            }
+
+            // Generate views for each extent in parallel
+            var errorBag = new ConcurrentBag<ErrorLog>();
+            var viewBag = new ConcurrentBag<KeyValuePair<EntitySetBase, GeneratedView>>();
+
+            Parallel.ForEach(extents, extent =>
+            {
+                // Each thread uses its own local ViewSet to avoid contention
+                var localViews = new ViewSet(EqualityComparer<EntitySetBase>.Default);
+
+                try
+                {
+                    // (1) view generation (checks that extents are fully mapped)
+                    var queryRewriter = GenerateDirectionalViewsForExtent(viewTarget, extent, identifiers, localViews);
+
+                    // (2) validation for update views
+                    if (viewTarget == ViewTarget.UpdateView
+                        &&
+                        m_config.IsValidationEnabled)
+                    {
+                        var validator = new RewritingValidator(queryRewriter.ViewgenContext, queryRewriter.BasicView);
+                        validator.Validate();
+                    }
+                }
+                catch (InternalMappingException exception)
+                {
+                    // All exceptions have mapping errors in them
+                    Debug.Assert(
+                        exception.ErrorLog.Count > 0,
+                        "Incorrectly created mapping exception");
+                    errorBag.Add(exception.ErrorLog);
+                }
+
+                // Collect generated views for merging
+                foreach (var kvp in localViews.KeyValuePairs)
+                {
+                    foreach (var v in kvp.Value)
+                    {
+                        viewBag.Add(new KeyValuePair<EntitySetBase, GeneratedView>(kvp.Key, v));
+                    }
+                }
+            });
+
+            // Merge results on the calling thread (single-threaded, safe)
             var errorLog = new ErrorLog();
+            foreach (var log in errorBag)
+            {
+                errorLog.Merge(log);
+            }
+            foreach (var kvp in viewBag)
+            {
+                views.Add(kvp.Key, kvp.Value);
+            }
 
-            // Generate views for each extent
-            foreach (var extent in extentCellMap.Keys)
+            if (isQueryView)
+            {
+                m_config.SetTimeForFinishedActivity(PerfType.QueryViews);
+            }
+            else
+            {
+                m_config.SetTimeForFinishedActivity(PerfType.UpdateViews);
+            }
+
+            return errorLog;
+        }
+
+        private ErrorLog GenerateDirectionalViewsSequential(
+            ViewTarget viewTarget, bool isQueryView, List<EntitySetBase> extents,
+            CqlIdentifiers identifiers, ViewSet views)
+        {
+            var errorLog = new ErrorLog();
+            foreach (var extent in extents)
             {
                 if (m_config.IsViewTracing)
                 {
@@ -293,10 +378,8 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
                 }
                 try
                 {
-                    // (1) view generation (checks that extents are fully mapped)
                     var queryRewriter = GenerateDirectionalViewsForExtent(viewTarget, extent, identifiers, views);
 
-                    // (2) validation for update views
                     if (viewTarget == ViewTarget.UpdateView
                         &&
                         m_config.IsValidationEnabled)
@@ -318,7 +401,6 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
                 }
                 catch (InternalMappingException exception)
                 {
-                    // All exceptions have mapping errors in them
                     Debug.Assert(
                         exception.ErrorLog.Count > 0,
                         "Incorrectly created mapping exception");
@@ -360,14 +442,6 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
             {
                 // generate the view for Extent only
                 queryRewriter = GenerateViewsForExtentAndType(extent.ElementType, context, identifiers, views, ViewGenMode.OfTypeViews);
-            }
-            if (viewTarget == ViewTarget.QueryView)
-            {
-                m_config.SetTimeForFinishedActivity(PerfType.QueryViews);
-            }
-            else
-            {
-                m_config.SetTimeForFinishedActivity(PerfType.UpdateViews);
             }
 
             // cache this rewriter (and context inside it) for future use in FK checking

@@ -2,6 +2,7 @@
 
 namespace System.Data.Entity.Core.Mapping.ViewGeneration
 {
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Data.Entity.Core.Common.Utils;
     using System.Data.Entity.Core.Mapping.ViewGeneration.Structures;
@@ -13,6 +14,7 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
     using System.Diagnostics;
     using System.Linq;
     using System.Text;
+    using System.Threading.Tasks;
     using CellGroup = System.Data.Entity.Core.Common.Utils.Set<Structures.Cell>;
 
     internal abstract class ViewgenGatekeeper : InternalBase
@@ -95,6 +97,9 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
                 return viewGenResults;
             }
 
+            var inheritanceGraph2 =
+                MetadataHelper.BuildUndirectedGraphOfTypes(containerMapping.StorageMappingItemCollection.EdmItemCollection);
+
             foreach (var cellGroup in cellGroups)
             {
                 if (!DoesCellGroupContainEntitySet(cellGroup, entity))
@@ -106,7 +111,7 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
                 var groupErrorLog = new ErrorLog();
                 try
                 {
-                    viewGenerator = new ViewGenerator(cellGroup, config, foreignKeyConstraints, containerMapping);
+                    viewGenerator = new ViewGenerator(cellGroup, config, foreignKeyConstraints, containerMapping, inheritanceGraph2);
                 }
                 catch (InternalMappingException exception)
                 {
@@ -166,36 +171,99 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
 
             var partitioner = new CellPartitioner(cells, foreignKeyConstraints);
             var cellGroups = partitioner.GroupRelatedCells();
-            foreach (var cellGroup in cellGroups)
+
+            // Pre-compute the inheritance graph once (it depends only on the immutable EdmItemCollection)
+            var inheritanceGraph =
+                MetadataHelper.BuildUndirectedGraphOfTypes(containerMapping.StorageMappingItemCollection.EdmItemCollection);
+
+            if (cellGroups.Count <= 1)
             {
-                ViewGenerator viewGenerator = null;
-                var groupErrorLog = new ErrorLog();
-                try
+                // Single group: skip parallel overhead
+                foreach (var cellGroup in cellGroups)
                 {
-                    viewGenerator = new ViewGenerator(cellGroup, config, foreignKeyConstraints, containerMapping);
-                }
-                catch (InternalMappingException exception)
-                {
-                    // All exceptions have mapping errors in them
-                    Debug.Assert(exception.ErrorLog.Count > 0, "Incorrectly created mapping exception");
-                    groupErrorLog = exception.ErrorLog;
-                }
+                    ViewGenerator viewGenerator = null;
+                    var groupErrorLog = new ErrorLog();
+                    try
+                    {
+                        viewGenerator = new ViewGenerator(cellGroup, config, foreignKeyConstraints, containerMapping, inheritanceGraph);
+                    }
+                    catch (InternalMappingException exception)
+                    {
+                        Debug.Assert(exception.ErrorLog.Count > 0, "Incorrectly created mapping exception");
+                        groupErrorLog = exception.ErrorLog;
+                    }
 
-                if (groupErrorLog.Count == 0)
-                {
-                    Debug.Assert(viewGenerator != null);
-                    groupErrorLog = viewGenerator.GenerateAllBidirectionalViews(viewGenResults.Views, identifiers);
-                }
+                    if (groupErrorLog.Count == 0)
+                    {
+                        Debug.Assert(viewGenerator != null);
+                        groupErrorLog = viewGenerator.GenerateAllBidirectionalViews(viewGenResults.Views, identifiers);
+                    }
 
-                if (groupErrorLog.Count != 0)
-                {
-                    viewGenResults.AddErrors(groupErrorLog);
+                    if (groupErrorLog.Count != 0)
+                    {
+                        viewGenResults.AddErrors(groupErrorLog);
+                    }
                 }
             }
-            // We used to print the errors here. Now we trace them as they are being thrown
-            //if (viewGenResults.HasErrors && config.IsViewTracing) {
-            //    Helpers.StringTraceLine(viewGenResults.ErrorsToString());
-            //}
+            else
+            {
+                // Multiple independent cell groups: process in parallel.
+                // Each cell group is independent by construction (connected components of the extent/FK graph)
+                // so they can be processed concurrently with thread-local state.
+                var errorBag = new ConcurrentBag<ErrorLog>();
+                var viewBag = new ConcurrentBag<KeyValuePair<EntitySetBase, GeneratedView>>();
+
+                Parallel.ForEach(cellGroups, cellGroup =>
+                {
+                    // Each thread gets its own config copy (Stopwatch is not thread-safe)
+                    var localConfig = config.CreateCopy();
+                    ViewGenerator viewGenerator = null;
+                    var groupErrorLog = new ErrorLog();
+                    try
+                    {
+                        viewGenerator = new ViewGenerator(
+                            cellGroup, localConfig, foreignKeyConstraints, containerMapping, inheritanceGraph);
+                    }
+                    catch (InternalMappingException exception)
+                    {
+                        Debug.Assert(exception.ErrorLog.Count > 0, "Incorrectly created mapping exception");
+                        groupErrorLog = exception.ErrorLog;
+                    }
+
+                    if (groupErrorLog.Count == 0)
+                    {
+                        Debug.Assert(viewGenerator != null);
+                        var localViews = new KeyToListMap<EntitySetBase, GeneratedView>(
+                            EqualityComparer<EntitySetBase>.Default);
+                        groupErrorLog = viewGenerator.GenerateAllBidirectionalViews(localViews, identifiers);
+
+                        // Collect generated views for post-merge
+                        foreach (var kvp in localViews.KeyValuePairs)
+                        {
+                            foreach (var v in kvp.Value)
+                            {
+                                viewBag.Add(new KeyValuePair<EntitySetBase, GeneratedView>(kvp.Key, v));
+                            }
+                        }
+                    }
+
+                    if (groupErrorLog.Count != 0)
+                    {
+                        errorBag.Add(groupErrorLog);
+                    }
+                });
+
+                // Merge results on the calling thread (single-threaded, safe)
+                foreach (var log in errorBag)
+                {
+                    viewGenResults.AddErrors(log);
+                }
+                foreach (var kvp in viewBag)
+                {
+                    viewGenResults.Views.Add(kvp.Key, kvp.Value);
+                }
+            }
+
             return viewGenResults;
         }
 

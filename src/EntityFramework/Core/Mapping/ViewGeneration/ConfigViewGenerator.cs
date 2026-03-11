@@ -74,6 +74,22 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
 
         internal bool GenerateViewsForEachType { get; set; }
 
+        // <summary>
+        // Creates a lightweight copy with independent timing state (Stopwatch)
+        // but the same configuration flags. Suitable for parallel view generation.
+        // </summary>
+        internal ConfigViewGenerator CreateCopy()
+        {
+            return new ConfigViewGenerator
+            {
+                GenerateEsql = GenerateEsql,
+                GenerateViewsForEachType = GenerateViewsForEachType,
+                TraceLevel = TraceLevel,
+                IsValidationEnabled = IsValidationEnabled,
+                GenerateUpdateViews = GenerateUpdateViews,
+            };
+        }
+
         internal bool IsViewTracing
         {
             get { return IsTraceAllowed(ViewGenTraceLevel.ViewsOnly); }
