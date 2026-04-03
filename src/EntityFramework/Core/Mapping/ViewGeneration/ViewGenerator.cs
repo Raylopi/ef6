@@ -6,6 +6,7 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
     using System.Collections.Generic;
     using System.Data.Entity.Core.Common.CommandTrees;
     using System.Data.Entity.Core.Common.Utils;
+    using System.Data.Entity.Core.Mapping.ViewGeneration.CqlGeneration;
     using System.Data.Entity.Core.Mapping.ViewGeneration.QueryRewriting;
     using System.Data.Entity.Core.Mapping.ViewGeneration.Structures;
     using System.Data.Entity.Core.Mapping.ViewGeneration.Validation;
@@ -452,8 +453,13 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
             }
             else
             {
-                // generate the view for Extent only
-                queryRewriter = GenerateViewsForExtentAndType(extent.ElementType, context, identifiers, views, ViewGenMode.OfTypeViews);
+                // Fast-path: for trivial extents (single cell, no conditions, no subtypes),
+                // generate the eSQL view directly without invoking QueryRewriter/SAT machinery.
+                if (!TryGenerateTrivialView(viewTarget, extent, context, identifiers, views))
+                {
+                    // generate the view for Extent only
+                    queryRewriter = GenerateViewsForExtentAndType(extent.ElementType, context, identifiers, views, ViewGenMode.OfTypeViews);
+                }
             }
 
             // cache this rewriter (and context inside it) for future use in FK checking
