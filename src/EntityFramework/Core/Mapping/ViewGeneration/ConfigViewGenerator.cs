@@ -42,6 +42,34 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
         private bool m_generateUpdateViews = true;
 
         // <summary>
+        // Diagnostic counter: number of extents that took the trivial-view fast-path.
+        // </summary>
+        private int m_trivialViewsFastPathed;
+        internal int TrivialViewsFastPathed
+        {
+            get { return m_trivialViewsFastPathed; }
+        }
+
+        internal void IncrementTrivialViewsFastPathed()
+        {
+            System.Threading.Interlocked.Increment(ref m_trivialViewsFastPathed);
+        }
+
+        // <summary>
+        // Diagnostic counter: number of extents that took the full QueryRewriter path.
+        // </summary>
+        private int m_trivialViewsFullPath;
+        internal int TrivialViewsFullPath
+        {
+            get { return m_trivialViewsFullPath; }
+        }
+
+        internal void IncrementTrivialViewsFullPath()
+        {
+            System.Threading.Interlocked.Increment(ref m_trivialViewsFullPath);
+        }
+
+        // <summary>
         // If true then view generation will produce eSQL, otherwise CQTs only.
         // </summary>
         internal bool GenerateEsql { get; set; }
