@@ -464,7 +464,12 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
             }
 
             // cache this rewriter (and context inside it) for future use in FK checking
-            m_queryRewriterCache[extent] = queryRewriter;
+            // Only cache non-null rewriters: a null would cause an NPE in CreateViewgenContext
+            // if the same extent is looked up again (e.g. via GenerateQueryViewForSingleExtent).
+            if (queryRewriter != null)
+            {
+                m_queryRewriterCache[extent] = queryRewriter;
+            }
             return queryRewriter;
         }
 
@@ -545,6 +550,18 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
         // Attempts to generate a trivial eSQL view for a simple 1:1 extent mapping,
         // bypassing the expensive QueryRewriter/SAT machinery.
         // Returns true if the fast-path was taken and the view was added to <paramref name="views"/>.
+        //
+        // The generated eSQL matches the canonical format produced by the full code generator:
+        //   SELECT VALUE -- Constructing {ExtentName}
+        //       [NS.CType](T1.{Set}_{Prop0}, T1.{Set}_{Prop1}, ...)
+        //   FROM (
+        //       SELECT
+        //           T.{sCol0} AS {Set}_{Prop0},
+        //           T.{sCol1} AS {Set}_{Prop1},
+        //           ...,
+        //           True AS _from0
+        //       FROM StoreContainer.StoreTable AS T
+        //   ) AS T1
         // </summary>
         private bool TryGenerateTrivialView(
             ViewTarget viewTarget,
@@ -560,7 +577,13 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
                 return false;
             }
 
-            // Condition 1 & 3: exactly one wrapper (one mapping fragment)
+            // Only handle plain entity sets (not association sets).
+            if (!(extent is EntitySet))
+            {
+                return false;
+            }
+
+            // Condition 1: exactly one wrapper (one mapping fragment — no entity splitting).
             if (context.AllWrappersForExtent.Count != 1)
             {
                 return false;
@@ -568,27 +591,20 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
 
             var wrapper = context.AllWrappersForExtent[0];
 
-            // Condition 2: no condition (discriminator) members on left side
+            // Condition 2: no condition (discriminator) members on left side (no TPH).
             var domainMap = context.MemberMaps.LeftDomainMap;
             if (domainMap.ConditionMembers(extent).Any())
             {
                 return false;
             }
 
-            // Condition 4: no WHERE clauses on either side of the cell
+            // Condition 3: no WHERE clause on the fragment query.
             if (!wrapper.FragmentQuery.Condition.IsTrue)
             {
                 return false;
             }
 
-            // Also verify the original cell queries have trivial WHERE clauses
-            var cell = wrapper.OnlyInputCell;
-            if (!cell.CQuery.WhereClause.IsTrue || !cell.SQuery.WhereClause.IsTrue)
-            {
-                return false;
-            }
-
-            // Condition 5: the element type has no subtypes in the EdmItemCollection
+            // Condition 4: the element type has no concrete subtypes (no TPT).
             var edmItemCollection = m_entityContainerMapping.StorageMappingItemCollection.EdmItemCollection;
             if (MetadataHelper.GetTypeAndSubtypesOf(extent.ElementType, edmItemCollection, false).Skip(1).Any())
             {
@@ -596,68 +612,78 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
             }
 
             // All trivial conditions met — generate the eSQL view directly.
-            // For QueryView: left = C-side, right = S-side
-            // View: SELECT VALUE [CType](T.col1, T.col2, ...) FROM [SContainer].[SExtent] AS T
-            var cQuery = cell.CQuery; // C-side query
-            var sQuery = cell.SQuery; // S-side query
-            var cExtent = cQuery.Extent; // C-side extent (the one we're generating the view for)
-            var sExtent = sQuery.Extent; // S-side extent (the source table)
+            var cell = wrapper.OnlyInputCell;
+            var cQuery = cell.CQuery; // C-side (conceptual) query
+            var sQuery = cell.SQuery; // S-side (store) query
+            var cExtent = cQuery.Extent; // C-side entity set
+            var sExtent = sQuery.Extent; // S-side (store) entity set
 
             var numSlots = cQuery.NumProjectedSlots;
 
-            var builder = new StringBuilder(1024);
-
-            // SELECT VALUE -- Constructing <ExtentName>
-            builder.Append("SELECT VALUE -- Constructing ");
-            builder.AppendLine(cExtent.Name);
-            builder.Append("    ");
-
-            // [Namespace.TypeName](
-            CqlWriter.AppendEscapedTypeName(builder, cExtent.ElementType);
-            builder.Append('(');
-
-            // Build the projection: T.sCol AS cProp, ...
-            var isFirst = true;
+            // Pre-compute valid slot pairs and their canonical aliases.
+            // Alias format: {CEntitySetName}_{CPropertyLeafName}  — matches the real code generator.
+            var aliases = new List<string>(numSlots);
+            var sSlots = new List<MemberProjectedSlot>(numSlots);
             for (var i = 0; i < numSlots; i++)
             {
                 var cSlot = cQuery.ProjectedSlots[i] as MemberProjectedSlot;
                 var sSlot = sQuery.ProjectedSlots[i] as MemberProjectedSlot;
-
-                // Skip null slots (can happen for non-mapped structural placeholders)
                 if (cSlot == null || sSlot == null)
                 {
                     continue;
                 }
+                aliases.Add(cExtent.Name + "_" + cSlot.MemberPath.LeafName);
+                sSlots.Add(sSlot);
+            }
 
-                if (!isFirst)
+            if (aliases.Count == 0)
+            {
+                return false;
+            }
+
+            var builder = new StringBuilder(512);
+
+            // Outer: SELECT VALUE -- Constructing {Name}
+            //            [NS.CType](T1.alias0, T1.alias1, ...)
+            builder.Append("SELECT VALUE -- Constructing ");
+            builder.AppendLine(cExtent.Name);
+            builder.Append("    ");
+            CqlWriter.AppendEscapedTypeName(builder, cExtent.ElementType);
+            builder.Append('(');
+            for (var i = 0; i < aliases.Count; i++)
+            {
+                if (i > 0)
                 {
                     builder.Append(", ");
                 }
-
-                // T.<sColumn>
-                sSlot.MemberPath.AsEsql(builder, "T");
-
-                isFirst = false;
+                builder.Append("T1.");
+                CqlWriter.AppendEscapedName(builder, aliases[i]);
             }
+            builder.AppendLine(")");
 
-            builder.Append(')');
-            builder.AppendLine();
-
-            // FROM [SContainer].[SExtent] AS T
-            builder.Append("FROM ");
+            // FROM (subquery) AS T1
+            builder.AppendLine("FROM (");
+            builder.AppendLine("    SELECT ");
+            for (var i = 0; i < sSlots.Count; i++)
+            {
+                builder.Append("        ");
+                sSlots[i].MemberPath.AsEsql(builder, "T");
+                builder.Append(" AS ");
+                CqlWriter.AppendEscapedName(builder, aliases[i]);
+                builder.AppendLine(", ");
+            }
+            builder.AppendLine("        True AS _from0");
+            builder.Append("    FROM ");
             CqlWriter.AppendEscapedQualifiedName(builder, sExtent.EntityContainer.Name, sExtent.Name);
-            builder.Append(" AS T");
+            builder.AppendLine(" AS T");
+            builder.Append(") AS T1");
 
-            var eSQLView = builder.ToString();
-
-            // Create the GeneratedView - eSQL-only; commandTree will be lazy-parsed on first access
             var generatedView = GeneratedView.CreateGeneratedView(
-                cExtent, cExtent.ElementType, null, eSQLView,
+                cExtent, cExtent.ElementType, null, builder.ToString(),
                 m_entityContainerMapping.StorageMappingItemCollection, m_config);
             views.Add(cExtent, generatedView);
 
             m_config.IncrementTrivialViewsFastPathed();
-
             return true;
         }
 
