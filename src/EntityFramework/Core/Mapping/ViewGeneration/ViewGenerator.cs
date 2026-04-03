@@ -297,8 +297,9 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
             // Generate views for each extent in parallel
             var errorBag = new ConcurrentBag<ErrorLog>();
             var viewBag = new ConcurrentBag<KeyValuePair<EntitySetBase, GeneratedView>>();
+            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
 
-            Parallel.ForEach(extents, extent =>
+            Parallel.ForEach(extents, parallelOptions, extent =>
             {
                 // Each thread uses its own local ViewSet to avoid contention
                 var localViews = new ViewSet(EqualityComparer<EntitySetBase>.Default);
@@ -337,12 +338,13 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
             });
 
             // Merge results on the calling thread (single-threaded, safe)
+            // Sort by EntitySetBase name for deterministic output ordering
             var errorLog = new ErrorLog();
             foreach (var log in errorBag)
             {
                 errorLog.Merge(log);
             }
-            foreach (var kvp in viewBag)
+            foreach (var kvp in viewBag.OrderBy(v => v.Key.Name, StringComparer.Ordinal))
             {
                 views.Add(kvp.Key, kvp.Value);
             }
@@ -407,6 +409,16 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
                     errorLog.Merge(exception.ErrorLog);
                 }
             }
+
+            if (isQueryView)
+            {
+                m_config.SetTimeForFinishedActivity(PerfType.QueryViews);
+            }
+            else
+            {
+                m_config.SetTimeForFinishedActivity(PerfType.UpdateViews);
+            }
+
             return errorLog;
         }
 

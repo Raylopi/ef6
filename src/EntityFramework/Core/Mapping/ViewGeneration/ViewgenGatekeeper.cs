@@ -212,8 +212,9 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
                 // so they can be processed concurrently with thread-local state.
                 var errorBag = new ConcurrentBag<ErrorLog>();
                 var viewBag = new ConcurrentBag<KeyValuePair<EntitySetBase, GeneratedView>>();
+                var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
 
-                Parallel.ForEach(cellGroups, cellGroup =>
+                Parallel.ForEach(cellGroups, parallelOptions, cellGroup =>
                 {
                     // Each thread gets its own config copy (Stopwatch is not thread-safe)
                     var localConfig = config.CreateCopy();
@@ -254,11 +255,12 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
                 });
 
                 // Merge results on the calling thread (single-threaded, safe)
+                // Sort by EntitySetBase name for deterministic output ordering
                 foreach (var log in errorBag)
                 {
                     viewGenResults.AddErrors(log);
                 }
-                foreach (var kvp in viewBag)
+                foreach (var kvp in viewBag.OrderBy(v => v.Key.Name, StringComparer.Ordinal))
                 {
                     viewGenResults.Views.Add(kvp.Key, kvp.Value);
                 }
