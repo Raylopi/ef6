@@ -1442,6 +1442,77 @@ namespace System.Data.Entity.Core.Mapping
         }
 
         /// <summary>
+        /// Generates views only for the cell groups that contain at least one entity set
+        /// whose name is in <paramref name="entitySetNamesToRegenerate"/>.
+        /// All validation (CellGroupValidator, FK constraints) runs normally for every regenerated group.
+        /// </summary>
+        /// <param name="entitySetNamesToRegenerate">
+        /// Names of C-side entity sets that changed. The method automatically expands each name
+        /// to the full connected cell group (via FK / entity-splitting graph), so the caller
+        /// does not need to worry about related entities.
+        /// </param>
+        /// <param name="errors">Output error list, same contract as GenerateViews().</param>
+        /// <returns>
+        /// Dictionary: EntitySetBase → DbMappingView,
+        /// containing ONLY the views of the regenerated groups.
+        /// Does NOT contain views of unchanged groups — the caller is responsible for merging.
+        /// </returns>
+        public Dictionary<EntitySetBase, DbMappingView> GenerateViewsIncremental(
+            ISet<string> entitySetNamesToRegenerate,
+            IList<EdmSchemaError> errors)
+        {
+            Check.NotNull(entitySetNamesToRegenerate, "entitySetNamesToRegenerate");
+            Check.NotNull(errors, "errors");
+
+            var views = new Dictionary<EntitySetBase, DbMappingView>();
+
+            if (GetItems<EntityContainerMapping>().Count != 1)
+            {
+                throw new InvalidOperationException(Strings.ViewGenMultipleContainers);
+            }
+
+            var containerMapping = GetItems<EntityContainerMapping>().Single();
+
+            if (!containerMapping.HasViews)
+            {
+                return views;
+            }
+
+            if (!containerMapping.HasMappingFragments())
+            {
+                Debug.Assert(
+                    2088 == (int)MappingErrorCode.MappingAllQueryViewAtCompileTime,
+                    "Please change the ERRORCODE_MAPPINGALLQUERYVIEWATCOMPILETIME value as well.");
+
+                errors.Add(
+                    new EdmSchemaError(
+                        Strings.Mapping_AllQueryViewAtCompileTime(containerMapping.Identity),
+                        (int)MappingErrorCode.MappingAllQueryViewAtCompileTime,
+                        EdmSchemaErrorSeverity.Warning));
+
+                return views;
+            }
+
+            var viewGenResults = ViewgenGatekeeper.GenerateViewsFromMappingIncremental(
+                containerMapping, new ConfigViewGenerator { GenerateEsql = true }, entitySetNamesToRegenerate);
+
+            if (viewGenResults.HasErrors)
+            {
+                viewGenResults.Errors.Each(e => errors.Add(e));
+            }
+
+            foreach (var extentViewPair in viewGenResults.Views.KeyValuePairs)
+            {
+                // Multiple views are returned for an extent but the first view is 
+                // the only one that we will use for now. In the future, we might 
+                // start using the other views which are per type within an extent.
+                views.Add(extentViewPair.Key, new DbMappingView(extentViewPair.Value[0].eSQL));
+            }
+
+            return views;
+        }
+
+        /// <summary>
         /// Factory method that creates a <see cref="StorageMappingItemCollection" />.
         /// </summary>
         /// <param name="edmItemCollection">

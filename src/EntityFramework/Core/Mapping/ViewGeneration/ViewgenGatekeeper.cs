@@ -38,6 +38,28 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
         }
 
         // <summary>
+        // Entry point for Incremental View Generation (filtered by entity set names).
+        // Regenerates views only for cell groups containing the specified entity sets.
+        // </summary>
+        // <returns> Generated Views for EntitySets in the specified groups only </returns>
+        internal static ViewGenResults GenerateViewsFromMappingIncremental(
+            EntityContainerMapping containerMapping, ConfigViewGenerator config,
+            ISet<string> entitySetNamesToRegenerate)
+        {
+            DebugCheck.NotNull(containerMapping);
+            DebugCheck.NotNull(config);
+            DebugCheck.NotNull(entitySetNamesToRegenerate);
+            Debug.Assert(containerMapping.HasViews, "Precondition Violated: No mapping exists to generate views for!");
+
+            //Create Cells from EntityContainerMapping
+            var cellCreator = new CellCreator(containerMapping);
+            var cells = cellCreator.GenerateCells();
+            var identifiers = cellCreator.Identifiers;
+
+            return GenerateViewsFromCells(cells, config, identifiers, containerMapping, entitySetNamesToRegenerate);
+        }
+
+        // <summary>
         // Entry point for Type specific generation of Query Views
         // </summary>
         internal static ViewGenResults GenerateTypeSpecificQueryView(
@@ -143,12 +165,14 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
         // effects: Given a list of cells in the schema, generates the query and
         // update mapping views for OFTYPE(Extent, Type) combinations in this schema
         // container. Returns a list of generated query and update views.
+        // If entitySetNameFilter is provided, only cell groups containing those entity sets are regenerated.
         // If it is false and some columns in a table are unmapped, an
         // exception is raised
         private static ViewGenResults GenerateViewsFromCells(
             List<Cell> cells, ConfigViewGenerator config,
             CqlIdentifiers identifiers,
-            EntityContainerMapping containerMapping)
+            EntityContainerMapping containerMapping,
+            ISet<string> entitySetNameFilter = null)
         {
             DebugCheck.NotNull(cells);
             DebugCheck.NotNull(config);
@@ -171,6 +195,16 @@ namespace System.Data.Entity.Core.Mapping.ViewGeneration
 
             var partitioner = new CellPartitioner(cells, foreignKeyConstraints);
             var cellGroups = partitioner.GroupRelatedCells();
+
+            // If filtering to specific entity sets, keep only groups that contain them
+            if (entitySetNameFilter != null && entitySetNameFilter.Count > 0)
+            {
+                cellGroups = cellGroups
+                    .Where(group => group.Any(cell =>
+                        entitySetNameFilter.Contains(cell.CQuery.Extent.Name) ||
+                        entitySetNameFilter.Contains(cell.SQuery.Extent.Name)))
+                    .ToList();
+            }
 
             // Pre-compute the inheritance graph once (it depends only on the immutable EdmItemCollection)
             var inheritanceGraph =
